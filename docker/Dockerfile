@@ -10,7 +10,8 @@ LABEL maintainer="support@taiga.io"
 WORKDIR /taiga-events
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
-COPY . /taiga-events
+COPY src/ ./src/
+COPY docker/ ./docker/
 
 # grab su-exec for easy step-down from root
 # https://github.com/ncopa/su-exec
