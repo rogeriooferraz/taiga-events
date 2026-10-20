@@ -8,6 +8,7 @@
 
 const { subscribe, unsubscribe } = require("./client");
 const { logger } = require("../logger");
+const { canSubscribe } = require("../ws/authorization");
 
 /**
  * Events subscriptions
@@ -27,6 +28,7 @@ class Subscription {
     this.ws = ws;
     this.routing_key = routing_key;
     this.options = options ? options : {};
+    this.delivery = Promise.resolve();
   }
 
   /**
@@ -34,8 +36,19 @@ class Subscription {
    * @param msg Message object
    * @return {void|*}
    */
-  handleMessage(msg) {
-    const content = JSON.parse(msg.content.toString());
+  async handleMessage(msg) {
+    if (!await canSubscribe(this.routing_key, this.auth)) {
+      this.ws.close(4003, "subscription authorization expired");
+      return;
+    }
+    if (this.ws.readyState !== 1) return;
+    let content;
+    try {
+      content = JSON.parse(msg.content.toString());
+    } catch {
+      logger.error("Invalid broker event payload");
+      return;
+    }
     if (content.session_id === this.auth.sessionId && !this.options.selfNotification) {
       return;
     }
@@ -46,8 +59,7 @@ class Subscription {
     try {
       return this.ws.send(clientMsgStr);
     } catch (error) {
-      logger.error(`error sending: ${clientMsgStr}`);
-      return logger.error(`error: ${error}`);
+      return logger.error("WebSocket event delivery failed: %s", error.message);
     }
   }
 
@@ -59,7 +71,10 @@ class Subscription {
     return subscribe(
       this.client_id,
       this.routing_key,
-      this.handleMessage.bind(this)
+      msg => {
+        this.delivery = this.delivery.then(() => this.handleMessage(msg))
+          .catch(() => logger.error("WebSocket event delivery failed"));
+      }
     );
   }
 

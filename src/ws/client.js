@@ -6,11 +6,12 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-const { v4 } = require("uuid");
+const { randomUUID } = require("crypto");
 
 const { SubscriptionManager } = require("../rabbitmq");
 const { logger } = require("../logger");
-const { getUserId, verify } = require("../crypto");
+const { verify } = require("../crypto");
+const { canSubscribe } = require("./authorization");
 
 let clients = {};
 
@@ -22,9 +23,10 @@ class Client {
    * @constructor
    * @param ws  WebSocket instance
    */
-  constructor(ws) {
+  constructor(ws, request) {
     this.ws = ws;
-    this.id = v4();
+    this.remoteAddress = request.socket.remoteAddress;
+    this.id = randomUUID();
     this.handleEvents();
   }
 
@@ -34,7 +36,7 @@ class Client {
    */
   handleEvents() {
     this.ws.on("message", this.handleMessage.bind(this));
-    return this.ws.on("error", this.handleError);
+    return this.ws.on("error", this.handleError.bind(this));
   }
 
   /**
@@ -43,12 +45,8 @@ class Client {
    * @return {*}
    */
   handleError(error) {
-    const { headers } = this.ws.upgradeReq;
-    logger.error(
-      "evt=client_errorx_forwarded_for=%s",
-      headers["x-forwarded-for"]
-    );
-    return logger.error(error);
+    logger.error("evt=client_error remote_address=%s error=%s",
+                 this.remoteAddress, error.message);
   }
 
   /**
@@ -61,26 +59,19 @@ class Client {
     try {
       msg = JSON.parse(message);
     } catch {
-      logger.error(`Error parsing message: ${message}`);
+      logger.error("Error parsing WebSocket message");
       return null;
     }
 
     if (msg.cmd === "ping") {
-      logger.debug(`PING: ${message}`);
+      logger.debug("PING");
       return this.sendPong();
     } else {
-      logger.info(`${msg.cmd}: ${message}`);
+      logger.info("WebSocket command received");
       if (msg.cmd === "auth" && msg.data) {
         return this.authUser(msg.data);
       } else if (msg.cmd === "subscribe" && msg.routing_key) {
-        if (this.auth && msg.routing_key.indexOf("live_notifications") === 0) {
-          const userId = getUserId(this.auth.token);
-          if (userId) {
-            return this.addSubscription(`live_notifications.${userId}`);
-          }
-        } else {
-          return this.addSubscription(msg.routing_key, msg.options);
-        }
+        return this.addSubscription(msg.routing_key, msg.options);
       } else if (msg.cmd === "unsubscribe" && msg.routing_key) {
         return this.removeSubscription(msg.routing_key);
       }
@@ -93,7 +84,7 @@ class Client {
    * @return {{sessionId}|{token}|*}
    */
   authUser(auth) {
-    if (auth.token && auth.sessionId && verify(auth.token)) {
+    if (!this.auth && auth.token && auth.sessionId && verify(auth.token)) {
       return (this.auth = auth);
     }
   }
@@ -104,8 +95,10 @@ class Client {
    * @param options
    * @return {*}
    */
-  addSubscription(routing_key, options) {
-    if (this.auth) {
+  async addSubscription(routing_key, options) {
+    const auth = this.auth;
+    if (auth && await canSubscribe(routing_key, auth) &&
+        this.auth === auth && this.ws.readyState === 1) {
       if (!this.subscriptionManager) {
         this.subscriptionManager = new SubscriptionManager(
           this.id,
@@ -159,8 +152,8 @@ class Client {
  * @param ws
  * @return {*}
  */
-const createClient = ws => {
-  const client = new Client(ws);
+const createClient = (ws, request) => {
+  const client = new Client(ws, request);
   clients[client.id] = client;
   logger.info(`ws-connection-open: ${client.id}`);
 

@@ -12,10 +12,9 @@ var jwt = require('jsonwebtoken');
 
 const secret = process.env.SECRET;
 const options = {
-  algorithm: process.env.ALGORITHM || 'HS256',
+  algorithms: [process.env.ALGORITHM || 'HS256'],
   audience: process.env.AUDIENCE || '',
-  issuer: process.env.ISSUER || '',
-  ignoreExpiration: 'true'
+  issuer: process.env.ISSUER || ''
 };
 const userIdClaim = process.env.USER_ID_CLAIM || 'user_id';
 
@@ -28,6 +27,7 @@ const userIdClaim = process.env.USER_ID_CLAIM || 'user_id';
 const getUserId = token => {
   try {
     const payload = jwt.verify(token, secret, options);
+    if (!payload.exp || payload.token_type !== 'access') return null;
     return payload[userIdClaim];
   } catch (err) {
     logger.error(`crypto: ${JSON.stringify(err)}`);
@@ -47,8 +47,8 @@ const verify = token => {
   }
 
   try {
-    jwt.verify(token, secret, options);
-    return true;
+    const payload = jwt.verify(token, secret, options);
+    return Boolean(payload.exp && payload.token_type === 'access');
   } catch (err) {
     logger.error(`crypto: ${JSON.stringify(err)}`);
   }

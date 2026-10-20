@@ -20,7 +20,8 @@ const { createClient } = require("./ws");
 const { webSocketServerProbe, RabbitMQProbe } = require("./health-check");
 
 const serverConfig = {
-  port: process.env.WEB_SOCKET_SERVER_PORT
+  port: process.env.WEB_SOCKET_SERVER_PORT,
+  maxPayload: 65536
 };
 
 /**
@@ -33,8 +34,8 @@ const wss = new Server(serverConfig, () => {
 /**
  * WS server connections listener
  */
-wss.on("connection", ws => {
-  return createClient(ws);
+wss.on("connection", (ws, request) => {
+  return createClient(ws, request);
 });
 
 /**
