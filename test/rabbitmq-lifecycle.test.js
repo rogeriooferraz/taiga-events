@@ -9,6 +9,7 @@ const assert = require("node:assert/strict");
 
 const amqpPath = require.resolve("amqplib");
 const channels = [];
+const brokerConnections = [];
 let connections = 0;
 let bindGate;
 let closeGate;
@@ -18,11 +19,14 @@ require.cache[amqpPath] = {
   loaded: true,
   exports: { connect: async () => {
     connections += 1;
-    return {
-      on() {},
+    const listeners = {};
+    const connection = {
+      on(event, listener) { listeners[event] = listener; },
+      disconnect() { listeners.close(); },
       createChannel: async () => {
         const channel = {
           consumed: false,
+          on() {},
           assertExchange: async () => ({}),
           assertQueue: async () => ({ queue: "temporary" }),
           bindQueue() { return bindGate; },
@@ -37,6 +41,8 @@ require.cache[amqpPath] = {
         return channel;
       }
     };
+    brokerConnections.push(connection);
+    return connection;
   } }
 };
 const broker = require("../src/rabbitmq/client");
@@ -93,4 +99,23 @@ test("client declarations do not overlap an auto-deleting exchange", async () =>
   await Promise.all([first, second]);
   assert.equal(channels.length, before + 2);
   await Promise.all([broker.destroy("client-2"), broker.destroy("client-3")]);
+});
+
+test("broker loss clears stale channels and permits a new connection", async () => {
+  bindGate = Promise.resolve();
+  closeGate = Promise.resolve();
+  await broker.subscribe("client-4", "notifications", () => {});
+  let disconnects = 0;
+  const listener = () => { disconnects += 1; };
+  broker.brokerEvents.on("disconnect", listener);
+  const oldConnection = brokerConnections.at(-1);
+  oldConnection.disconnect();
+  assert.equal(disconnects, 1);
+  const priorChannelCount = channels.length;
+  await broker.subscribe("client-5", "notifications", () => {});
+  assert.equal(connections, 2);
+  assert.equal(channels.length, priorChannelCount + 1);
+  assert.equal(await broker.destroy("client-4"), false);
+  await broker.destroy("client-5");
+  broker.brokerEvents.off("disconnect", listener);
 });

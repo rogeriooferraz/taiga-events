@@ -7,6 +7,7 @@
  */
 
 const { connect } = require("amqplib");
+const { EventEmitter } = require("node:events");
 const { logger } = require("../logger");
 
 const amqpUrl = process.env.RABBITMQ_URL;
@@ -34,6 +35,7 @@ const config = {
     noAck: true
   }
 };
+const brokerEvents = new EventEmitter();
 
 // The exchange is auto-deleted after its last binding is removed. Keep
 // declarations, bindings, and channel closes ordered across clients.
@@ -54,7 +56,16 @@ const getConnection = (() => {
     if (!connectionPromise) {
       connectionPromise = connect(`${amqpUrl}?heartbeat=60`)
         .then(connection => {
-          connection.on("close", () => { connectionPromise = null; });
+          connection.on("error", error => {
+            logger.error("rabbitmq-connection-error: %s", error.message);
+          });
+          connection.on("close", () => {
+            logger.warn("rabbitmq-connection-closed");
+            connectionPromise = null;
+            channels.clear();
+            subscriptions.clear();
+            brokerEvents.emit("disconnect");
+          });
           return connection;
         })
         .catch(error => {
@@ -89,6 +100,11 @@ const channels = (() => {
     });
   };
 
+  const clear = () => {
+    chs = {};
+    pendingChannels = {};
+  };
+
   /**
    * Get client
    * @param client_id   Id of client
@@ -105,6 +121,10 @@ const channels = (() => {
         return connection.createChannel();
       })
       .then(channel => {
+        channel.on("error", error => {
+          logger.error("rabbitmq-channel-error client_id: %s error: %s",
+                       client_id, error.message);
+        });
         chs[client_id] = channel;
         return channel;
       });
@@ -115,7 +135,8 @@ const channels = (() => {
   };
   return {
     removeClient: removeClient,
-    get: get
+    get: get,
+    clear
   };
 })();
 
@@ -236,10 +257,13 @@ const subscriptions = (() => {
     return delete subs[client_id];
   };
 
+  const clear = () => { subs = {}; };
+
   return {
     subscribe: subscribe,
     unsubscribe: unsubscribe,
-    removeClient: removeClient
+    removeClient: removeClient,
+    clear
   };
 })();
 
@@ -257,5 +281,6 @@ module.exports = {
   subscribe: subscriptions.subscribe,
   unsubscribe: subscriptions.unsubscribe,
   destroy,
-  getConnection
+  getConnection,
+  brokerEvents
 };

@@ -9,11 +9,20 @@
 const { randomUUID } = require("crypto");
 
 const { SubscriptionManager } = require("../rabbitmq");
+const { brokerEvents } = require("../rabbitmq/client");
 const { logger } = require("../logger");
 const { verify } = require("../crypto");
 const { canSubscribe } = require("./authorization");
 
 let clients = {};
+
+brokerEvents.on("disconnect", () => {
+  for (const client of Object.values(clients)) {
+    if (client.ws.readyState === 1) {
+      client.ws.close(1011, "broker connection lost");
+    }
+  }
+});
 
 /**
  * Common WS client
