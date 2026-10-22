@@ -35,25 +35,34 @@ const config = {
   }
 };
 
+// The exchange is auto-deleted after its last binding is removed. Keep
+// declarations, bindings, and channel closes ordered across clients.
+let brokerOperation = Promise.resolve();
+const serializeBrokerOperation = operation => {
+  const result = brokerOperation.then(operation);
+  brokerOperation = result.catch(() => {});
+  return result;
+};
+
 /**
  * Return the connection, creates the connection if it does not exist.
  * @return {Promise}
  */
 const getConnection = (() => {
-  let connection = null;
+  let connectionPromise = null;
   return () => {
-    return new Promise((resolve, reject) => {
-      if (!connection) {
-        return connect(`${amqpUrl}?heartbeat=60`)
-          .then(conn => {
-            connection = conn;
-            return resolve(connection);
-          })
-          .catch(e => reject(e));
-      } else {
-        return resolve(connection);
-      }
-    });
+    if (!connectionPromise) {
+      connectionPromise = connect(`${amqpUrl}?heartbeat=60`)
+        .then(connection => {
+          connection.on("close", () => { connectionPromise = null; });
+          return connection;
+        })
+        .catch(error => {
+          connectionPromise = null;
+          throw error;
+        });
+    }
+    return connectionPromise;
   };
 })();
 
@@ -71,18 +80,12 @@ const channels = (() => {
    * @return {PromiseLike<boolean> | Promise<boolean>}
    */
   const removeClient = client_id => {
-    if (!chs[client_id]) {
-      return Promise.resolve();
-    }
-
-    const client = get(client_id);
-
-    delete chs[client_id];
-
+    const client = pendingChannels[client_id] || Promise.resolve(chs[client_id]);
     return client.then(channel => {
-      logger.debug(`rabbitmq-channel-close client_id: ${client_id}`)
-      channel.close();
-      return true;
+      if (!channel) return false;
+      delete chs[client_id];
+      logger.debug(`rabbitmq-channel-close client_id: ${client_id}`);
+      return channel.close().then(() => true);
     });
   };
 
@@ -95,24 +98,19 @@ const channels = (() => {
     if (pendingChannels[client_id]) {
       return pendingChannels[client_id];
     }
-    pendingChannels[client_id] = new Promise((resolve, reject) => {
-      if (!chs[client_id]) {
-        return getConnection()
-          .then(connection => {
-            logger.debug(`rabbitmq-channel-create client_id: ${client_id}`)
-            return connection.createChannel();
-          })
-          .then(channel => {
-            chs[client_id] = channel;
-            return resolve(chs[client_id]);
-          });
-      } else {
-        return resolve(chs[client_id]);
-      }
-    });
-    return pendingChannels[client_id].then(ch => {
+    if (chs[client_id]) return Promise.resolve(chs[client_id]);
+    const pending = getConnection()
+      .then(connection => {
+        logger.debug(`rabbitmq-channel-create client_id: ${client_id}`);
+        return connection.createChannel();
+      })
+      .then(channel => {
+        chs[client_id] = channel;
+        return channel;
+      });
+    pendingChannels[client_id] = pending;
+    return pending.finally(() => {
       delete pendingChannels[client_id];
-      return ch;
     });
   };
   return {
@@ -172,9 +170,10 @@ const subscriptions = (() => {
    * @return {Buffer|{noLocal, consumerTag, ticket: number, noAck, exclusive, arguments: *, queue: *, nowait: boolean}}
    */
   const bindAndSubscribe = (channel, queue, routing_key, cb) => {
-    channel.bindQueue(queue, config.exchange.name, routing_key);
-    return channel.consume(queue, cb, {
-      noAck: config.channel.noAck
+    return channel.bindQueue(queue, config.exchange.name, routing_key).then(() => {
+      return channel.consume(queue, cb, {
+        noAck: config.channel.noAck
+      });
     });
   };
 
@@ -198,7 +197,7 @@ const subscriptions = (() => {
    * @return { Promise }
    */
   const subscribe = (client_id, routing_key, cb) => {
-    return channels.get(client_id).then(channel => {
+    return serializeBrokerOperation(() => channels.get(client_id).then(channel => {
       return queues
         .create(channel)
         .then(queue => {
@@ -207,7 +206,7 @@ const subscriptions = (() => {
         .then(ok => {
           return registerSubscription(client_id, routing_key, ok.consumerTag);
         });
-    });
+    }));
   };
 
   /**
@@ -217,11 +216,14 @@ const subscriptions = (() => {
    * @return { Promise }
    */
   const unsubscribe = (client_id, routing_key) => {
-    return channels.get(client_id).then(channel => {
-      const consumerTag = subs[client_id][routing_key];
-      if (consumerTag !== void 0) {
-        return channel.cancel(consumerTag);
-      }
+    return serializeBrokerOperation(() => {
+      const consumerTag = subs[client_id] && subs[client_id][routing_key];
+      if (consumerTag === void 0) return false;
+      return channels.get(client_id).then(channel => channel.cancel(consumerTag))
+        .then(() => {
+          delete subs[client_id][routing_key];
+          return true;
+        });
     });
   };
 
@@ -248,7 +250,7 @@ const subscriptions = (() => {
  */
 const destroy = client_id => {
   subscriptions.removeClient(client_id);
-  return channels.removeClient(client_id);
+  return serializeBrokerOperation(() => channels.removeClient(client_id));
 };
 
 module.exports = {

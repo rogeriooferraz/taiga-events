@@ -35,7 +35,12 @@ class Client {
    * @return {*}
    */
   handleEvents() {
-    this.ws.on("message", this.handleMessage.bind(this));
+    this.ws.on("message", message => {
+      Promise.resolve().then(() => this.handleMessage(message)).catch(error => {
+        this.handleError(error);
+        if (this.ws.readyState === 1) this.ws.close(1011, "subscription failed");
+      });
+    });
     return this.ws.on("error", this.handleError.bind(this));
   }
 
@@ -158,7 +163,10 @@ const createClient = (ws, request) => {
   logger.info(`ws-connection-open: ${client.id}`);
 
   return client.ws.on("close", function() {
-    client.close();
+    Promise.resolve().then(() => client.close()).catch(error => {
+      logger.error("rabbitmq-channel-close-failed client_id: %s error: %s",
+                   client.id, error.message);
+    });
     logger.info(`ws-connection-close: ${client.id}`);
     return delete clients[client.id];
   });

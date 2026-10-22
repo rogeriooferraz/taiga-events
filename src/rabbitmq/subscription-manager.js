@@ -24,6 +24,16 @@ class SubscriptionManager {
     this.auth = auth;
     this.ws = ws;
     this.subscriptions = {};
+    this.operations = Promise.resolve();
+    this.closed = false;
+    this.closePromise = null;
+  }
+
+  enqueue(operation) {
+    const result = this.operations.then(operation);
+    // A failed operation is reported to its caller but must not block cleanup.
+    this.operations = result.catch(() => {});
+    return result;
   }
 
   /**
@@ -33,19 +43,21 @@ class SubscriptionManager {
    * @return {*}
    */
   add(routing_key, options) {
-    if (!this.subscriptions[routing_key]) {
-      this.subscriptions[routing_key] = {};
-    } else {
-      this.subscriptions[routing_key].stop();
-    }
-    this.subscriptions[routing_key] = new Subscription(
-      this.client_id,
-      this.auth,
-      this.ws,
-      routing_key,
-      options
-    );
-    return this.subscriptions[routing_key].start();
+    if (this.closed) return Promise.resolve(false);
+    return this.enqueue(async () => {
+      if (this.closed) return false;
+      const previous = this.subscriptions[routing_key];
+      if (previous) await previous.stop();
+      const subscription = new Subscription(
+        this.client_id,
+        this.auth,
+        this.ws,
+        routing_key,
+        options
+      );
+      this.subscriptions[routing_key] = subscription;
+      return subscription.start();
+    });
   }
 
   /**
@@ -54,13 +66,15 @@ class SubscriptionManager {
    * @return {boolean}
    */
   remove(routing_key) {
-    if (
-      this.subscriptions[routing_key] &&
-      this.subscriptions[routing_key].stop
-    ) {
-      this.subscriptions[routing_key].stop();
-      return delete this.subscriptions[routing_key];
-    }
+    if (this.closed) return Promise.resolve(false);
+    return this.enqueue(async () => {
+      if (this.closed) return false;
+      const subscription = this.subscriptions[routing_key];
+      if (!subscription) return false;
+      await subscription.stop();
+      delete this.subscriptions[routing_key];
+      return true;
+    });
   }
 
   /**
@@ -68,8 +82,13 @@ class SubscriptionManager {
    * @return {*}
    */
   destroy() {
-    this.subscriptions = {};
-    return destroy(this.client_id);
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    this.closePromise = this.enqueue(async () => {
+      this.subscriptions = {};
+      return destroy(this.client_id);
+    });
+    return this.closePromise;
   }
 }
 
